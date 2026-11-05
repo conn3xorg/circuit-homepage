@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      # The release before the default, so the upgrade below has an install
+      # to move.
+      - name: Apply the previous release, then plan again with no changes
+        working-directory: examples/local
+        env:
+          TF_VAR_homepage_version: v2.6.0
+          TF_VAR_image_digest: sha256:3e38fe788223cb46a3ce1f046ef11667b40f7707fdca0dcbfa3f86c5c42bf1e8
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Loads the dashboard, sees a wrong Host refused, reads the services and
+      # bookmarks back with the env file's value filled in, and has Homepage
+      # check a site that answers and one that doesn't.
+      - name: Use the dashboard on the previous release
+        working-directory: examples/local
+        run: &check sudo podman exec -i circuit-homepage podman exec -i homepage node --input-type=module - < check.mjs
+      - name: Upgrade to the default release, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+          sudo podman exec circuit-homepage podman inspect homepage --format '{{.ImageName}}' | grep -q '@sha256:19c5c0918445'
+      - name: Use the dashboard after the upgrade
+        working-directory: examples/local
+        run: *check
+      # The env file's value reaches the host write-only, so state holds none
+      # of it, and nothing Conn3x writes under .terraform does either.
+      # .terraform/modules is left out: it holds downloaded module code.
+      - name: Check the secret stays out of state
+        working-directory: examples/local
+        run: |
+          test -s terraform.tfstate || { echo "No terraform.tfstate to check." >&2; exit 1; }
+          if grep -rqF --exclude-dir=modules -e hello-from-an-env-file terraform.tfstate .terraform/; then
+            echo "The example's secret is in terraform.tfstate or under .terraform/." >&2
+            exit 1
+          fi
+      # A file that isn't the YAML Homepage wants is refused before it
+      # replaces the one Homepage reads. The next good apply puts back the
+      # restart step the failed one took down.
+      - name: Refuse a services file that isn't a list
+        working-directory: examples/local
+        run: |
+          printf 'module "homepage" {\n  services = "title: not a list"\n}\n' > ci_override.tf
+          if conn3x apply -auto-approve > bad.log 2>&1; then
+            cat bad.log; exit 1
+          fi
+          rm ci_override.tf
+          grep -q "services.yaml must hold a list" bad.log
+          sudo podman exec circuit-homepage grep -q 'This host' /var/lib/homepage/config/services.yaml
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Restarting the container boots systemd again, so this checks Homepage
+      # is enabled and comes back with its config.
+      - name: Restart the host, then use the dashboard again
+        working-directory: examples/local
+        run: |
+          sudo podman restart circuit-homepage
+          for _ in $(seq 60); do
+            case $(sudo podman exec circuit-homepage systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          sudo podman exec circuit-homepage systemctl is-active homepage
+          for _ in $(seq 120); do
+            sudo podman exec circuit-homepage podman exec homepage true 2>/dev/null && break
+            sleep 2
+          done
+          sudo podman exec -i circuit-homepage podman exec -i homepage node --input-type=module - < check.mjs
+      - name: Plan again after the restart, with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Check only root can enter the config directory
+        run: '[ "$(sudo podman exec circuit-homepage stat -c "%u %a" /var/lib/homepage)" = "0 700" ]'
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
