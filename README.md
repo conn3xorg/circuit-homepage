@@ -18,7 +18,7 @@ variable "proxmox_password" {
 }
 
 module "homepage" {
-  source = "github.com/conn3xorg/circuit-homepage?ref=v0.1.0"
+  source = "github.com/conn3xorg/circuit-homepage?ref=v0.2.0"
 
   hosts                = { home = "192.168.1.50" }
   ssh_private_key_file = "~/.ssh/id_ed25519"
@@ -161,7 +161,7 @@ On each host, in order:
 
 ## Requirements
 
-Requires Conn3x v0.7.0 or later, for the check before each file is replaced, and systemd on each host. The image is built for amd64 and arm64. Each host needs to reach its package mirror and `ghcr.io`. `conn3x init` fetches circuit-podman from GitHub.
+Requires Conn3x v0.37.0 or later, for a wait that runs again after each restart, and systemd on each host. The image is built for amd64 and arm64. Each host needs to reach its package mirror and `ghcr.io`. `conn3x init` fetches circuit-podman from GitHub.
 
 ## Tested on
 

@@ -5,9 +5,6 @@ locals {
   local_host = lookup({ "0.0.0.0" = "127.0.0.1", "::" = "[::1]" }, var.listen_address, strcontains(var.listen_address, ":") ? "[${var.listen_address}]" : var.listen_address)
   local_url  = "http://${local.local_host}:${var.port}"
 
-  # Waits for a listener on the port, read from /proc so the host needs no ss.
-  wait_port = "for _ in $(seq 900); do grep -qE ':${format("%04X", var.port)} [0-9A-F]+:[0-9A-F]{4} 0A ' /proc/net/tcp /proc/net/tcp6 2>/dev/null && exit 0; sleep 1; done; echo 'Nothing listened on port ${var.port} in 15 minutes. See journalctl -u homepage.' >&2; exit 1"
-
   # A string is written as it is, so a file from an existing install can be
   # pasted in. Anything else is converted to YAML.
   files = {
@@ -119,19 +116,20 @@ circuit "config" {
   }
 
   # A changed file restarts Homepage, so it starts again from the new files.
-  # Then it waits for the port: the wait_for below was already met before the
+  # The port step follows this one's revision, so it waits again after the
   # restart. A change to the environment alone is caught by the next plan.
   step "restart" {
-    command {
-      command  = "systemctl restart homepage.service && ${local.wait_port}"
+    service_action {
+      name     = "homepage"
       triggers = sha256(jsonencode([local.content, local.image, var.listen_address, var.port, var.allowed_hosts]))
     }
   }
 
   step "port" {
     wait_for {
-      port    = var.port
-      timeout = "15m"
+      port     = var.port
+      timeout  = "15m"
+      triggers = { restart = conn3x_service_action.config__restart[each.key].revision }
     }
   }
 }
